@@ -1932,6 +1932,7 @@ struct Deferred {
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
     /// Textures whose contents the list brings up to date.
+    gpu_detiles: Vec<std::sync::Arc<crate::texture::Staging>>,
     textures: std::collections::HashSet<usize>,
     /// Bottom-of-pipe writes, done once the list has run: address, what,
     /// bytes.
@@ -6308,7 +6309,8 @@ impl HostList {
             (real != *first)
                 .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
         }));
-        if barriers.is_empty() && syncs.is_empty() {
+        let deferred = self.deferred();
+        if barriers.is_empty() && syncs.is_empty() && deferred.gpu_detiles.is_empty() {
             return None;
         }
         let Some((allocator, list)) = self
@@ -6331,6 +6333,9 @@ impl HostList {
                 }
                 if !barriers.is_empty() {
                     list.ResourceBarrier(&barriers);
+                }
+                for staging in &deferred.gpu_detiles {
+                    staging.record_gpu_detile(list);
                 }
                 list.Close()
             })
@@ -6760,6 +6765,10 @@ impl HostList {
 
     /// Brings a texture's staging buffer up to date when the list is
     /// submitted, keeping it alive until the list is reset.
+    pub(crate) fn defer_gpu_detile(&self, staging: std::sync::Arc<crate::texture::Staging>) {
+        self.deferred().gpu_detiles.push(staging);
+    }
+
     pub(crate) fn defer_texture(&self, staging: std::sync::Arc<crate::texture::Staging>) {
         self.deferred().copies.push(Step::Texture(staging));
     }
