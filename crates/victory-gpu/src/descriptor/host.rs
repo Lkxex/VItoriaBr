@@ -3907,6 +3907,8 @@ mod own_copy_tests {
     /// that address in another format through `texture::alias`.
     #[test]
     fn placed_unordered_texture_view_mirrors_and_aliases_to_shader_view() {
+        use super::*;
+
         let Some(host) = host() else {
             return; // no host GPU
         };
