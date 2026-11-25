@@ -11,6 +11,7 @@ mod decode;
 use decode::ConsoleOnly;
 use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use victory_core::fence_watch::{self, Ticket};
 use windows_sys::Win32::System::Diagnostics::Debug::CONTEXT;
 
 const CONTINUE_EXECUTION: i32 = -1;
@@ -45,6 +46,10 @@ thread_local! {
 static EMULATED: AtomicU64 = AtomicU64::new(0);
 static ASKED: AtomicU64 = AtomicU64::new(0);
 static ZEROED: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    static FENCE_TICKET: Cell<Option<Ticket>> = const { Cell::new(None) };
+}
 
 fn readable(va: usize, bytes: usize) -> bool {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery};
@@ -149,8 +154,18 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
                 }
             }
         }
-        ConsoleOnly::Monitorx => {}
-        ConsoleOnly::Mwaitx => std::hint::spin_loop(),
+        ConsoleOnly::Monitorx => {
+            if fence_watch::enabled() {
+                FENCE_TICKET.with(|slot| slot.set(Ticket::arm(ctx.Rax as usize)));
+            }
+        }
+        ConsoleOnly::Mwaitx => {
+            if let Some(ticket) = FENCE_TICKET.with(Cell::take) {
+                ticket.wait();
+            } else {
+                std::hint::spin_loop();
+            }
+        }
         ConsoleOnly::Clzero => {
             // with an address-size prefix (0x67) the line is at EAX, zero-extended
             let a32 = code[..len - 3].contains(&0x67);
@@ -246,4 +261,67 @@ pub(crate) unsafe fn emulate(ctx: &mut CONTEXT) -> i32 {
         );
     }
     CONTINUE_EXECUTION
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "measures the emulation loop with a synthetic fence producer"]
+    fn bench_emulated_fence_wait() {
+        use std::sync::atomic::Ordering::{Acquire, Release};
+        use std::time::{Duration, Instant};
+
+        const SIGNALS: u64 = 64;
+        let completed = AtomicU64::new(0);
+        let address = completed.as_ptr() as usize;
+        let signal = fence_watch::Signal::register(address);
+        let mut code = [0x90_u8; 24];
+        code[..6].copy_from_slice(&[0x0f, 0x01, 0xfa, 0x0f, 0x01, 0xfb]);
+        let base = code.as_ptr() as u64;
+        // SAFETY: a plain context. The handler only reads the code above.
+        let mut ctx: CONTEXT = unsafe { std::mem::zeroed() };
+        ctx.Rax = address as u64;
+        let (ready, start) = std::sync::mpsc::sync_channel(0);
+        let began = Instant::now();
+        let mut pairs = 0;
+        std::thread::scope(|scope| {
+            let completed = &completed;
+            let signal = &signal;
+            scope.spawn(move || {
+                start.recv().unwrap();
+                for value in 1..=SIGNALS {
+                    std::thread::sleep(Duration::from_millis(3));
+                    completed.store(value, Release);
+                    signal.notify();
+                }
+            });
+            ready.send(()).unwrap();
+            for next in 1..=SIGNALS {
+                ctx.Rsi = next;
+                while completed.load(Acquire) < next {
+                    ctx.Rip = base;
+                    // SAFETY: the context points at the synthetic instructions.
+                    assert_eq!(unsafe { emulate(&mut ctx) }, CONTINUE_EXECUTION);
+                    assert_eq!(ctx.Rip, base + 3);
+                    if completed.load(Acquire) >= next {
+                        break;
+                    }
+                    // SAFETY: the context points at the second instruction.
+                    assert_eq!(unsafe { emulate(&mut ctx) }, CONTINUE_EXECUTION);
+                    assert_eq!(ctx.Rip, base + 6);
+                    pairs += 1;
+                }
+            }
+        });
+        // A final monitor can be armed as the producer signals, then skipped.
+        FENCE_TICKET.with(Cell::take);
+        eprintln!(
+            "fence wait enabled={}: {pairs} emulated pairs for {SIGNALS} signals in {:.1} ms",
+            fence_watch::enabled(),
+            began.elapsed().as_secs_f64() * 1_000.0
+        );
+        assert_eq!(completed.load(Acquire), SIGNALS);
+    }
 }
